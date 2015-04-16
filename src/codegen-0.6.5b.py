@@ -1,3 +1,4 @@
+
 import sys
 import re
 import xml.etree.ElementTree as ET
@@ -16,6 +17,7 @@ from subprocess import call, Popen, PIPE
 import tempfile
 
 from optparse import OptionParser
+from collections import defaultdict
 
 # Operation control
 ENABLE_INDENT=False
@@ -59,7 +61,14 @@ class bcolors:
         self.WARNING = ''
         self.FAIL = ''
         self.ENDC = ''
-
+class compVar(object):
+    def __init__(self, varName):
+        self.varName=varName
+        self.type=""
+        self.min=""
+        self.max=""
+        self.scope=""
+        self.compLevel=""
 class codegen(object):
     def __init__(self, target, foname, nvcc_args):
         self.oacc_kernelId=0     # number of kernels which are replaced by function calls
@@ -76,6 +85,7 @@ class codegen(object):
         self.oacc_kernelsPrivatizin=[] # per kernel list of variable to be privated (used for copy-in copy-out)
         self.oacc_kernelsTemplates=[] # templates corresponding to each kernel
         self.oacc_kernelsAssociatedCopyIds=[] # a list of oacc_copys identifiers associated with each kernel
+        self.oacc_kernelsComp=[] # per kernel list of compression() variables declared over kernels directive
         self.oacc_loopSMC=[] # per call list of variables to be cached in SMC
         self.oacc_loopReductions=[] # per call list of variable to be reduced 
         self.oacc_loopPrivatizin=[] # per call list of variable to be privated 
@@ -87,7 +97,8 @@ class codegen(object):
         self.oacc_copysParent=[]   # array of functions name, indicating the function which is the parent of copy (associated with each elemnt in self.oacc_copys)
         self.oacc_copysVarNams=[] # list of array of variables defined in the copys' call scope
         self.oacc_copysVarTyps=[] # list of array of type of variables defined in the copys' call scope
-        
+        self.oacc_constCoefDefs='' # codes of constant memory definitions for stroring compression coefficients
+                
         self.code='' # intermediate generated C code
         self.code_include='#include <stdlib.h>\n#include <stdio.h>\n#include <assert.h>\n#include <openacc.h>\n' # .h code including variable decleration and function prototypes
         #self.code_include='#include <stdlib.h>\n#include <stdio.h>\n#include <assert.h>\n#include <openacc.h>\nvoid ipmacc_prompt(char *s){\nif (getenv("IPMACC_VERBOSE"))\nprintf("%s",s);\n}\n' # .h code including variable decleration and function prototypes
@@ -102,6 +113,7 @@ class codegen(object):
                              # keep track of calls used in this code to declare them
         self.active_calls_decl=[] # list of tuple (call name, and call forward declaration)
                              # declaration of active calls which are not standard
+        self.func_comp_vars=defaultdict(list) # list of tuples:[local compressed variable,kernel compressed variable] for each active_calls_decl (func_comp_vars[funcName]=[function local compressed variable, kernel compressed variable]) 
         self.intrinsic_calls_ocl= [ 'acos', 'acosh', 'acospi', 'asin', 'asinh', 'asinpi', 'atan', 'atan2', 'atanh', 'atanpi', 'atan2pi',
                                 'cbrt', 'ceil', 'copysign', 'cos', 'cosh', 'cospi', 'erfc', 'erf', 'exp', 'exp2', 'exp10', 'expm1',
                                 'fabs', 'fdim', 'floor', 'fma', 'fmax', 'fmin', 'fmod', 'fract', 'frexp', 'hypot', 'ilogb', 'ldexp',
@@ -145,7 +157,7 @@ class codegen(object):
                                 'uchar2', 'char3', 'uchar3', 'char4', 'uchar4', 'short1', 'ushort1', 'short2', 'ushort2', 'uint2', 
                                 'int3', 'uint3', 'int4', 'uint4', 'long1', 'ulong1', 'short3', 'ushort3', 'short4', 'ushort4', 
                                 'int1', 'uint1', 'int2', 'long2', 'ulong2', 'long3', 'ulong3', 'long4', 'ulong4', 'longlong1', 
-                                'ulonglong1', 'longlong2', 'ulonglong2', 'float1', 'float2',# 'float3', 'float4',
+                                'ulonglong1', 'longlong2', 'ulonglong2', 'float1', 'float2', 'float3', 'float4',
                                 'double1', 'double2', 'double3', 'double4']
                                 # cuda types which are available
 
@@ -172,7 +184,6 @@ class codegen(object):
         self.prefix_kernel_privred_region='__kernel_privred_region_'
         self.prefix_kernel_smc_fetch='__kernel_smc_fetch_' # it may encompass fetch/initilization for one or more arrays
         self.prefix_kernel_smc_fetchend='__kernel_smc_fetchend_' # it may encompass fetch/initilization for one or more arrays
-        self.prefix_kernel_smc_startpointer='__kernel_smc_startpointer_' # it may encompass fetch/initilization for one or more arrays
         self.prefix_kernel_smc_varpref='__kernel_smc_var_data_' 
         self.prefix_kernel_smc_tagpref='__kernel_smc_var_tag_' 
         self.prefix_kernel_reduction_iterator='__kernel_reduction_iterator'
@@ -386,10 +397,10 @@ class codegen(object):
                 return True
         return False
 
-    def oacc_data_clauseparser(self,clause,type,inout,present,dID):
+    def oacc_data_clauseparser(self,clause,type,inout,present,compression,dID):
         # parse openacc data clause and return correponding type (copyin, copyout, copy, pcopyin, pcopyout, pcopy)
         code=''
-        regex = re.compile(r'([A-Za-z0-9_]+)([\ ]*)(\((.+?)\))*')
+        regex  = re.compile(r'([A-Za-z0-9_]+)([\ ]*)(\((.+?)\))*')
         #regex = re.compile(r'([A-Za-z0-9_]+)([\ ]*)(\((.+?)\))*')
         #regex = re.compile(r'([A-Za-z0-9\ ]+)\((.+?)\)')
         #for i in regex.findall(clause):
@@ -407,11 +418,17 @@ class codegen(object):
                     #tcode=tcode+'in="'+('true' if inout=='in' else 'false')+'" '
                     # present
                     tcode=tcode+'present="'+present+'" '
+                    tcode=tcode+'compression="'+compression+'" '
                     # dimensions
                     regex2 = re.compile(r'\[(.+?)\]')
                     dims=regex2.findall(str(j).replace(' ',''))
                     for dim in range(0,len(dims)):
-                        tcode=tcode+'dim'+str(dim)+'="'+dims[dim]+'" '
+                        if len(dims[dim].split(':')) > 2:
+                            tcode=tcode+'min="'+dims[dim].split(':')[2]+'" '
+                            tcode=tcode+'max="'+dims[dim].split(':')[3]+'" '
+                            tcode=tcode+'dim'+str(dim)+'="'+dims[dim].split(':')[0]+':'+dims[dim].split(':')[1]+'" '
+                        else:
+                            tcode=tcode+'dim'+str(dim)+'="'+dims[dim]+'" '
                     tcode+='clause="'+type+'" '
                     tcode+='dataid="'+dID+'" '
                     # end tag
@@ -435,23 +452,35 @@ class codegen(object):
         expressionAll=''
         # copy-in
         for it in ['copyin', 'copy']:
-            expressionIn=expressionIn+self.oacc_data_clauseparser(clauses,it,'true','false', dID)
+            expressionIn=expressionIn+self.oacc_data_clauseparser(clauses,it,'true','false','false', dID)
         for it in ['pcopy', 'present_or_copy', 'pcopyin', 'present_or_copyin']:
-            expressionIn=expressionIn+self.oacc_data_clauseparser(clauses,it,'true','true', dID)
+            expressionIn=expressionIn+self.oacc_data_clauseparser(clauses,it,'true','true','false', dID)
+        for it in ['ccopyin', 'ccopy', 'compression_copyin', 'compression_copy']:
+            expressionIn=expressionIn+self.oacc_data_clauseparser(clauses,it,'true','false','true', dID)
+        for it in ['pccopyin', 'pccopy', 'present_or_compression_copyin', 'present_or_compression_copy']:
+            expressionIn=expressionIn+self.oacc_data_clauseparser(clauses,it,'true','true','true', dID)
         # allocate-only
         for it in ['create']:
-            expressionAlloc=expressionAlloc+self.oacc_data_clauseparser(clauses,it,'create','true', dID)
+            expressionAlloc=expressionAlloc+self.oacc_data_clauseparser(clauses,it,'create','true','false', dID)
+        for it in ['ccreate', 'compression_create']:
+            expressionAlloc=expressionAlloc+self.oacc_data_clauseparser(clauses,it,'create','true','true', dID)
         # copy-out
         for it in ['copyout', 'copy']:
-            expressionOut=expressionOut+self.oacc_data_clauseparser(clauses,it,'false','false', dID)
+            expressionOut=expressionOut+self.oacc_data_clauseparser(clauses,it,'false','false','false', dID)
         for it in ['pcopy', 'present_or_copy', 'pcopyout', 'present_or_copyout']:
-            expressionOut=expressionOut+self.oacc_data_clauseparser(clauses,it,'false','true', dID)
+            expressionOut=expressionOut+self.oacc_data_clauseparser(clauses,it,'false','true','false', dID)
+        for it in ['ccopy', 'compression_copyin']:
+            expressionOut=expressionOut+self.oacc_data_clauseparser(clauses,it,'false','false','true', dID)
+        for it in ['pccopy', 'present_or_compression_copy']:
+            expressionOut=expressionOut+self.oacc_data_clauseparser(clauses,it,'false','true','true', dID)
         for it in ['copy', 'pcopy', 'present_or_copy', 'copyout', 'pcopyout', 'present_or_copyout', 'copyin', 'pcopyin', 'present_or_copyin', 'create', 'present', 'present_or_create']:
-            expressionAll=expressionAll+self.oacc_data_clauseparser(clauses,it,'false','false',dID)
+            expressionAll=expressionAll+self.oacc_data_clauseparser(clauses,it,'false','false','false',dID)
+        for it in ['ccopy', 'ccopyin', 'pccopy', 'pccopyin', 'compression_copy', 'compression_copyin', 'present_or_compression_copyin', 'present_or_compression_copy', 'ccreate', 'compression_create']:
+            expressionAll=expressionAll+self.oacc_data_clauseparser(clauses,it,'false','false','true',dID)
         return [expressionIn, expressionAlloc, expressionOut, expressionAll]
 
     def oacc_clauseparser_data_ispresent(self, clause):
-        for it in ['pcopy', 'present_or_copy', 'copyout', 'pcopyout', 'present_or_copyout', 'pcopyin', 'present_or_copyin', 'present', 'present_or_create']:
+        for it in ['pcopy', 'present_or_copy', 'copyout', 'pcopyout', 'present_or_copyout', 'pcopyin', 'present_or_copyin', 'present', 'present_or_create', 'pccopy', 'pccopyin', 'present_or_compression_copyin', 'present_or_compression_copy']:
             if clause==it:
                 return True
         return False
@@ -538,11 +567,11 @@ class codegen(object):
         else:
             print 'error: unimplemented platform'
             exit(-1)
-    def codegen_constructKernel(self, args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, smcinfo):
+    def codegen_constructKernel(self, args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, smcinfo, compInfo):
         if self.target_platform=='CUDA':
-            return self.constructKernel_cuda(args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, self.oacc_kernelsTemplates[kernelId], smcinfo)
+            return self.constructKernel_cuda(args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, self.oacc_kernelsTemplates[kernelId], smcinfo, compInfo)
         elif self.target_platform=='OPENCL':
-            return self.constructKernel_opencl(args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, self.oacc_kernelsTemplates[kernelId], smcinfo)
+            return self.constructKernel_opencl(args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, self.oacc_kernelsTemplates[kernelId], smcinfo, compInfo)
         else:
             print 'error: unimplemented platform'
             exit(-1)
@@ -554,7 +583,7 @@ class codegen(object):
         else:
             print 'error: unimplemented platform'
             exit(-1)
-    def codegen_memAlloc(self, dvar, size, hvar, type, scalar_copy, ispresent):
+    def codegen_memAlloc(self, dvar, size, hvar, type, scalar_copy, ispresent, compression, min, max):
 # OLD IMPLEMENTATION:
 #       code=''
 #        if self.target_platform=='CUDA':
@@ -568,13 +597,17 @@ class codegen(object):
 # API-based IMPLEMENTATION FIXME
         amp=('&' if scalar_copy else '')
         ast=('*' if scalar_copy else '')
-        fcall='acc_present_or_create' if ispresent else 'acc_create'
+        isRangeGiven=not (min=='' or max=='')
+        fcall='acc_'+('compression_' if compression=='true' else '')+('present_or_' if ispresent else '')+'create'
+#        fcall='acc_present_or_create' if ispresent else ('acc_create' if  compression=='false' else 'acc_compression_create')
+        if compression == 'true':
+            self.oacc_constCoefDefs+="__constant__ "+type.replace('*','').strip()+' __compress_constant_main_'+hvar+'[10];\n'
         if self.target_platform=='CUDA':
             # TODO code=dvar+'=('+type+ast+')'+fcall+'((void*)'+amp+hvar+','+size+');\n'
-            code=fcall+'((void*)'+amp+hvar+','+size+');\n'
+            code=fcall+'((void*)'+amp+hvar+','+size+((', '+('0' if isRangeGiven else '1')+', '+(min if isRangeGiven else '0' )+', '+ (max if isRangeGiven else '0')) if compression=='true' else '')+');\n'
         elif self.target_platform=='OPENCL':
             # TODO code=dvar+'=(cl_mem)'+fcall+'((void*)'+amp+hvar+','+size+');\n'
-            code=fcall+'((void*)'+amp+hvar+','+size+');\n'
+            code=fcall+'((void*)'+amp+hvar+','+size+ ', '+('0' if isRangeGiven else '1')+', '+(min if isRangeGiven else '0' )+', '+ (max if isRangeGiven else '0')+');\n'
         else:
             print 'error: unimplemented platform'
             exit(-1)
@@ -596,10 +629,27 @@ class codegen(object):
         code=''
         if self.target_platform=='CUDA':
             # TODO code+=dev+'=('+type+ast+')acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
-            code+='acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
+            code+='acc_'+present+'copyin((void*)'+host+','+bytes+', "'+type.replace('*','').strip()+'"); // '+type+'\n'
         elif self.target_platform=='OPENCL':
             # code+=dev+'=(cl_mem)acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
             code+='acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
+        else:
+            print 'error: unimplemented platform'
+            exit(-1)
+        return code
+
+    def codegen_accCompCopyin(self, host, dev, bytes, type, present, scalar_copy, parentFunc,min,max):
+        ast=('*' if scalar_copy else '')
+        code=''
+        isRangeGiven=not (min=='' or max=='')
+        if self.target_platform=='CUDA':
+            # TODO code+=dev+'=('+type+ast+')acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
+            code+='acc_'+present+'compress_copyin((void*)'+host+','+bytes+', "'+type.replace('*','').strip()+'", __compress_constant_main_'+host+', '+('0' if isRangeGiven else '1')+', '+(min if isRangeGiven else '0' )+', '+ (max if isRangeGiven else '0')+'); // '+type+'\n'
+            #self.oacc_constCoefDefs+="__constant__ "+type.replace('*','').strip()+' __compress_constant_main_'+host+'[10];\n'
+            #print self.code
+        elif self.target_platform=='OPENCL':
+            # code+=dev+'=(cl_mem)acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
+            code+='acc_'+present+'compress_copyin((void*)'+host+','+bytes+');\n'
         else:
             print 'error: unimplemented platform'
             exit(-1)
@@ -623,6 +673,16 @@ class codegen(object):
         code=''
         if self.target_platform=='CUDA' or self.target_platform=='OPENCL':
             code+='acc_copyout_and_keep((void*)'+host+','+bytes+');\n'
+        else:
+            print 'error: unimplemented platform'
+            exit(-1)
+        return code
+
+    def codegen_accPCompCopyout(self, host, dev, bytes, type, scalar_copy, parentFunc):
+        ast=('*' if scalar_copy else '')
+        code=''
+        if self.target_platform=='CUDA' or self.target_platform=='OPENCL':
+            code+='acc_decompress_copyout((void*)'+host+','+bytes+');\n'
         else:
             print 'error: unimplemented platform'
             exit(-1)
@@ -718,10 +778,12 @@ class codegen(object):
         #gridDim='('+'*'.join(forDims)+')/256+1'
         gridDim='('+forDims+')/'+blockDim+'+1'
         callArgs=[]
+        argTypeDict=defaultdict(list)
         for i in args:
             argName=i.split(' ')
             argType=' '.join(argName[0:len(argName)-1])
             argName=argName[len(argName)-1]
+            argTypeDict[argName]=argType
             if argName.find('__ipmacc_scalar')!=-1:
                 argName='&'+argName.replace('__ipmacc_scalar','')
             if argName.find('__ipmacc_reductionarray_internal')!=-1:
@@ -734,10 +796,28 @@ class codegen(object):
                 argName=argName.replace('__ipmacc_deviceptr','')
                 callArgs.append( '\n'+argName)
         kernelInvoc='\n/* kernel call statement '+str(self.oacc_kernelsAssociatedCopyIds[kerId])+'*/\n'
-        kernelInvoc+=('if (getenv("IPMACC_VERBOSE")) printf("IPMACC: Launching kernel '+str(kerId)+' > gridDim: %d\\tblockDim: %d\\n",'+gridDim+','+blockDim+');\n')
-        kernelInvoc+=self.prefix_kernel_gen+str(kerId)+'<<<'+gridDim+','+blockDim+'>>>('+(','.join(callArgs))+');'
-        kernelInvoc+='\n/* kernel call statement*/\n'
-        self.code=self.code.replace(self.prefix_kernel+str(kerId)+'();',kernelInvoc)
+        if len(self.oacc_kernelsComp[kerId])!=0:
+            kernelInvoc+='if(0' 
+            coefArgs=[]
+            for compVarObj in self.oacc_kernelsComp[kerId]:
+                kernelInvoc+='||acc_isComp('+str(compVarObj.varName)+')!=NULL'
+                coefArgs.append('\n('+argTypeDict[str(compVarObj.varName)]+')acc_get_coef('+str(compVarObj.varName)+')')
+            kernelInvoc+='){//Runtime compression check\n'
+            kernelInvoc+=('if (getenv("IPMACC_VERBOSE")) printf("IPMACC: Launching compression kernel '+str(kerId)+' > gridDim: %d\\tblockDim: %d\\n",'+gridDim+','+blockDim+');\n')
+            
+            #kernelInvoc+=self.prefix_kernel_gen+str(kerId)+'_compression<<<'+gridDim+','+blockDim+'>>>('+(','.join(callArgs+coefArgs))+');'
+            kernelInvoc+=self.prefix_kernel_gen+str(kerId)+'_compression<<<'+gridDim+','+blockDim+'>>>('+(','.join(callArgs))+');'
+            kernelInvoc+='\n}else{ /*simple kernel call statement*/\n'
+            kernelInvoc+=('if (getenv("IPMACC_VERBOSE")) printf("IPMACC: Launching simple kernel '+str(kerId)+' > gridDim: %d\\tblockDim: %d\\n",'+gridDim+','+blockDim+');\n')
+            kernelInvoc+=self.prefix_kernel_gen+str(kerId)+'<<<'+gridDim+','+blockDim+'>>>('+(','.join(callArgs))+');'
+            kernelInvoc+='\n}\n/* kernel call statement*/\n'
+            self.code=self.code.replace(self.prefix_kernel+str(kerId)+'();',kernelInvoc)
+        else:
+            kernelInvoc+=' /*kernel call statement*/\n'
+            kernelInvoc+=('if (getenv("IPMACC_VERBOSE")) printf("IPMACC: Launching simple kernel '+str(kerId)+' > gridDim: %d\\tblockDim: %d\\n",'+gridDim+','+blockDim+');\n')
+            kernelInvoc+=self.prefix_kernel_gen+str(kerId)+'<<<'+gridDim+','+blockDim+'>>>('+(','.join(callArgs))+');'
+            kernelInvoc+='\n/* kernel call statement*/\n'
+            self.code=self.code.replace(self.prefix_kernel+str(kerId)+'();',kernelInvoc)
     def reduceVariable_cuda(self, var, type, op, ctasize):
         arrname=self.prefix_kernel_reduction_shmem+type
         iterator=self.prefix_kernel_reduction_iterator
@@ -800,10 +880,30 @@ class codegen(object):
             code+='//^D end global critical secion\n'
         code+='}\n'
         return code
-    def constructKernel_cuda(self, args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, template, smcinfo):
-        code=template+' __global__ void '+self.prefix_kernel_gen+str(kernelId)
-        code=code+'('+(','.join(args)).replace('__ipmacc_deviceptr','')+')'
-        proto=code+';\n'
+    def constructKernel_cuda(self, args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, template, smcinfo, compInfo):
+        compCodeInit=''
+        simpleCodeInit=''
+        code=''
+        proto=''
+        coefArgs=[]
+        if len(self.oacc_kernelsComp[kernelId])!=0:
+            for compVarObj in self.oacc_kernelsComp[kernelId]:
+                for arg in args:
+                    if arg.replace('*',' ').split()[-1]==str(compVarObj.varName):
+                        coefArgs.append(('__compress_constant_'+str(compVarObj.varName)).join(arg.rsplit(str(compVarObj.varName),1)))
+                        compCodeInit+='#define '+str(compVarObj.varName)+'(index) decompress_'+arg.replace('*',' ').split()[0]+'((void*)'+str(compVarObj.varName)+', index, __compress_constant_main_'+str(compVarObj.varName)+')\n'
+                        compVarObj.type=arg.replace('*',' ').split()[0]
+            compCodeInit+=template+' __global__ void '+self.prefix_kernel_gen+str(kernelId)+'_compression'
+            #compCodeInit+='('+(','.join(args+coefArgs)).replace('__ipmacc_deviceptr','')+')'
+            compCodeInit+='('+(','.join(args)).replace('__ipmacc_deviceptr','')+')'
+            proto+=template+' __global__ void '+self.prefix_kernel_gen+str(kernelId)+'_compression'
+            #proto+='('+(','.join(args+coefArgs)).replace('__ipmacc_deviceptr','')+');'
+            proto+='('+(','.join(args)).replace('__ipmacc_deviceptr','')+');'
+        simpleCodeInit+=template+' __global__ void '+self.prefix_kernel_gen+str(kernelId)
+        simpleCodeInit+='('+(','.join(args)).replace('__ipmacc_deviceptr','')+')'
+        proto+='\n'+simpleCodeInit+';\n\n'
+
+        
         code+='{\n'
         code+='int '+self.prefix_kernel_uid+'=threadIdx.x+blockIdx.x*blockDim.x;\n'
         # fetch __ipmacc_scalar into register
@@ -850,40 +950,31 @@ class codegen(object):
         smc_select_calls=''
         smc_write_calls=''
         if len(smcinfo)>0:
-            if DEBUGSMC: print 'found smc clause'
             pfreelist=[]
             for [v, t, st, p, dw, up, div, a, dimlo, dimhi] in smcinfo:
                 fcall=self.prefix_kernel_smc_fetch+str(a)+'();'
                 if kernelB.find(fcall)==-1:
                     # this smc does not belong to this kernel, ignore 
-                    if DEBUGSMC: print 'skip> '+fcall
                     continue
                 length=self.blockDim_cuda+'+'+dw+'+'+up
                 # declare local memories
                 decl+='\n/* declare the shared memory of '+v+' */\n'
                 decl+='__shared__ '+t.replace('*','')+' '+self.prefix_kernel_smc_varpref+v+'['+length+'];\n'
                 decl+='__shared__ unsigned char '+self.prefix_kernel_smc_tagpref+v+'['+length+'];\n'
-                decl+='__shared__ unsigned int '+self.prefix_kernel_smc_startpointer+v+';\n'
                 decl+='{\n'
                 decl+='int iterator_of_smc=0;\n'
                 decl+='for(iterator_of_smc=threadIdx.x; iterator_of_smc<('+length+'); iterator_of_smc+=blockDim.x){\n'
-                decl+='//'+self.prefix_kernel_smc_varpref+v+'[iterator_of_smc]=0;\n'
+                decl+=self.prefix_kernel_smc_varpref+v+'[iterator_of_smc]=0;\n'
                 decl+=self.prefix_kernel_smc_tagpref+v+'[iterator_of_smc]=0;\n'
                 decl+='}\n__syncthreads();\n'
                 decl+='}\n'
                 if st=='READ_ONLY' or st=='READ_WRITE':
                     # fetch data to local memory
                     datafetch ='{ // fetch begins\nint kk;\n'
-                    datafetch+='if(threadIdx.x==0){\n'+self.prefix_kernel_smc_startpointer+v+'=(blockIdx.x*'+self.blockDim_cuda+')-'+dw+'+'+p+';\n}\n'
-                    if div=='false':
-                        datafetch+='int stride=blockDim.x;\n__syncthreads();\n'
-                    else:
-                        datafetch+='int stride=__syncthreads_count(1);\n'
-                    datafetch+='for(int kk=threadIdx.x; kk<=('+length+'); kk+=stride)\n'
-                    #datafetch+='for(int kk=threadIdx.x; kk<('+length+'); kk+=blockDim.x)\n'
+                    datafetch+='__syncthreads();\n'
+                    datafetch+='for(int kk=threadIdx.x; kk<('+length+'); kk+=blockDim.x)\n'
                     datafetch+='{\n'
-                    datafetch+='int idx='+self.prefix_kernel_smc_startpointer+v+'+kk;\n'
-                    #datafetch+='int idx=blockIdx.x*'+self.blockDim_cuda+'+kk-'+dw+'+'+p+';\n'
+                    datafetch+='int idx=blockIdx.x*'+self.blockDim_cuda+'+kk-'+dw+'+'+p+';\n'
                     datafetch+='if(idx<('+dimhi+') && idx>=('+dimlo+'))\n'
                     datafetch+='{\n'
                     datafetch+=self.prefix_kernel_smc_varpref+v+'[kk]='+v+'[idx];\n'
@@ -892,32 +983,29 @@ class codegen(object):
                     datafetch+='}\n'
                     datafetch+='__syncthreads();\n'
                     datafetch+='} // end of fetch\n'
-                    datafetch+='#define '+v+'(index) __smc_select_'+str(a)+'_'+v+'(index, (blockIdx.x*'+self.blockDim_cuda+')-('+dw+'), ((blockIdx.x+1)*'+self.blockDim_cuda+')+('+up+'), '+v+', '+self.prefix_kernel_smc_varpref+v+', '+self.blockDim_cuda+', '+p+', '+dw+', '+self.prefix_kernel_smc_startpointer+v+','+dimlo+','+dimhi+')\n'
+                    datafetch+='#define '+v+'(index) __smc_select_'+str(a)+'_'+v+'(index, (blockIdx.x*'+self.blockDim_cuda+')-('+dw+'), ((blockIdx.x+1)*'+self.blockDim_cuda+')+('+up+'), '+v+', '+self.prefix_kernel_smc_varpref+v+', '+self.blockDim_cuda+', '+p+', '+dw+')\n'
                     kernelB=kernelB.replace(fcall,datafetch+'\n'+fcall)
                 # construct the smc_select_ per array for READ
-                smc_select_calls+='__device__ '+t.replace('*','')+' __smc_select_'+str(a)+'_'+v+'(int index, int down, int up, '+t+' g_array, '+t+' s_array, int vector_size, int pivot, int before, unsigned int startptr, int lbnd, int ubnd){\n'
+                smc_select_calls+='__device__ '+t.replace('*','')+' __smc_select_'+str(a)+'_'+v+'(int index, int down, int up, '+t+' g_array, '+t+' s_array, int vector_size, int pivot, int before){\n'
                 if div=='false':
                     smc_select_calls+='// the pragmas are well-set. do not check the boundaries.\n'
-                    #smc_select_calls+='return s_array[index-(vector_size*blockIdx.x)+before-pivot];\n'
-                    smc_select_calls+='return s_array[index-startptr];\n'
+                    smc_select_calls+='return s_array[index-(vector_size*blockIdx.x)+before-pivot];\n'
                 else:
                     smc_select_calls+='// The tile is not well covered by the pivot, dw-range, and up-range\n'
                     smc_select_calls+='// dynamic runtime performs the check\n'
-                    smc_select_calls+='bool a=index>=down && index>=lbnd;\n'
-                    smc_select_calls+='bool b=index<=up && index<ubnd;\n'
+                    smc_select_calls+='bool a=index>=down;\n'
+                    smc_select_calls+='bool b=index<up;\n'
                     smc_select_calls+='bool d=a&b;\n'
                     smc_select_calls+='if(d){\n'
-                    #smc_select_calls+='return s_array[index-(vector_size*blockIdx.x)+before-pivot];\n'
-                    smc_select_calls+='return s_array[index-startptr];\n'
+                    smc_select_calls+='return s_array[index-(vector_size*blockIdx.x)+before-pivot];\n'
                     smc_select_calls+='}\n'
                     smc_select_calls+='return g_array[index];\n'
                 smc_select_calls+='}\n'
                 # construct the smc_write_ per array for WRITE
-                smc_write_calls+='__device__ void __smc_write_'+str(a)+'_'+v+'(int index, int down, int up, '+t+' g_array, '+t+' s_array, int vector_size, int pivot, int before,'+t.replace('*','')+' value, unsigned int startptr){\n'
+                smc_write_calls+='__device__ void __smc_write_'+str(a)+'_'+v+'(int index, int down, int up, '+t+' g_array, '+t+' s_array, int vector_size, int pivot, int before,'+t.replace('*','')+' value){\n'
                 if div=='false':
                     smc_write_calls+='// the pragmas are well-set. do not check the boundaries.\n'
-                    smc_write_calls+='s_array[index-startptr]=value;\n'
-                    #smc_write_calls+='s_array[index-(vector_size*blockIdx.x)+before-pivot]=value;\n'
+                    smc_write_calls+='s_array[index-(vector_size*blockIdx.x)+before-pivot]=value;\n'
                 else:
                     smc_write_calls+='// The tile is not well covered by the pivot, dw-range, and up-range\n'
                     smc_write_calls+='// dynamic runtime performs the check\n'
@@ -925,8 +1013,7 @@ class codegen(object):
                     smc_write_calls+='bool b=index<up;\n'
                     smc_write_calls+='bool d=a&b;\n'
                     smc_write_calls+='if(d){\n'
-                    smc_write_calls+='s_array[index-startptr]=value;\n'
-                    #smc_write_calls+='s_array[index-(vector_size*blockIdx.x)+before-pivot]=value;\n'
+                    smc_write_calls+='s_array[index-(vector_size*blockIdx.x)+before-pivot]=value;\n'
                     smc_write_calls+='}\n'
                     smc_write_calls+='g_array[index]=value;\n'
                 smc_write_calls+='}\n'
@@ -941,9 +1028,7 @@ class codegen(object):
                     exit(-1)
                 # for each arrayReference of 'v', replace [] with ()
                 writeIdxList=[]
-                for arrayRef in re.finditer('\\b'+v+'[\\ \\t\\n\\r]*\[',kernelB[changeRangeIdx_start:changeRangeIdx_end]):
-                    #skip to the end of variable
-                    arrayRef_it=changeRangeIdx_start+arrayRef.start(0)
+                for arrayRef in re.finditer('\\b'+v+'[\\ \\t\\n\\r]*\[',kernelB[changeRangeIdx_start:changeRangeIdx_end]): #skip to the end of variable arrayRef_it=changeRangeIdx_start+arrayRef.start(0)
                     arrayRef_pcnt=0
                     done=False
                     while not done:
@@ -979,7 +1064,7 @@ class codegen(object):
                         writeIdx_loc=']'.join('['.join(kernelB[writeIdx_str:assignmentIdx].split('[')[1:]).split(']')[:-1])
                         writeIdx_val=kernelB[assignmentIdx+1:writeIdx_end]
                         #writeIdx_replacer='__smc_write_'+str(a)+'_'+v+'('+v+','+self.prefix_kernel_smc_varpref+v+','+writeIdx_loc+','+writeIdx_val[:-1]+');'
-                        writeIdx_replacer='__syncthreads();\n__smc_write_'+str(a)+'_'+v+'('+writeIdx_loc+', (blockIdx.x*'+self.blockDim_cuda+')-('+dw+'), ((blockIdx.x+1)*'+self.blockDim_cuda+')+('+up+'), '+v+', '+self.prefix_kernel_smc_varpref+v+', '+self.blockDim_cuda+', '+p+', '+dw+','+writeIdx_val[:-1]+', '+self.prefix_kernel_smc_startpointer+v+');\n'
+                        writeIdx_replacer='__syncthreads();\n__smc_write_'+str(a)+'_'+v+'('+writeIdx_loc+', (blockIdx.x*'+self.blockDim_cuda+')-('+dw+'), ((blockIdx.x+1)*'+self.blockDim_cuda+')+('+up+'), '+v+', '+self.prefix_kernel_smc_varpref+v+', '+self.blockDim_cuda+', '+p+', '+dw+','+writeIdx_val[:-1]+');\n'
                         writeIdx_replacer+='__syncthreads();\n'
                         writeIdxList.append([v, a, p, dw, up, writeIdx_str, writeIdx_end, assignmentIdx])
                         print 'smc: write-access on ->\n\tlocation:'+writeIdx_loc+'\n\tstart-in-kernelB:'+str(writeIdx_str)+'\n\tend-in-kernelB:'+str(writeIdx_end)+'\n\tvalue-in-kernelB:'+writeIdx_val+'\n\tend-to-end-statement:<<'+kernelB[writeIdx_str:writeIdx_end]+'>> \n\treplacer:'+writeIdx_replacer
@@ -1007,7 +1092,7 @@ class codegen(object):
                     [v, a, p, dw, up, wst, wen, asgidx]=writeIdxList[wi]
                     writeIdx_loc=']'.join('['.join(kernelB[wst:asgidx].split('[')[1:]).split(']')[:-1])
                     writeIdx_val=kernelB[asgidx+1:wen]
-                    writeIdx_replacer='__syncthreads();\n__smc_write_'+str(a)+'_'+v+'('+writeIdx_loc+', (blockIdx.x*'+self.blockDim_cuda+')-('+dw+'), ((blockIdx.x+1)*'+self.blockDim_cuda+')+('+up+'), '+v+', '+self.prefix_kernel_smc_varpref+v+', '+self.blockDim_cuda+', '+p+', '+dw+','+writeIdx_val[:-1]+','+self.prefix_kernel_smc_startpointer+v+');\n'
+                    writeIdx_replacer='__syncthreads();\n__smc_write_'+str(a)+'_'+v+'('+writeIdx_loc+', (blockIdx.x*'+self.blockDim_cuda+')-('+dw+'), ((blockIdx.x+1)*'+self.blockDim_cuda+')+('+up+'), '+v+', '+self.prefix_kernel_smc_varpref+v+', '+self.blockDim_cuda+', '+p+', '+dw+','+writeIdx_val[:-1]+');\n'
                     writeIdx_replacer+='__syncthreads();\n'
                     kernelB=kernelB[0:wst]+writeIdx_replacer+kernelB[wen+1:]
                 # generate writeback code
@@ -1057,13 +1142,72 @@ class codegen(object):
             #for ids in rfreelist:
             #    fcall=self.prefix_kernel_reduction_region+str(ids)+'();'
             #    kernelB=kernelB.replace(fcall,'')
+        compKernelB=kernelB
+        if len(compInfo)>0:
+            for compVarObj in compInfo:
+                for arrayRef in re.finditer('\\b'+compVarObj.varName+'[\\ \\t\\n\\r]*\[',compKernelB):
+                    arrayRef_it=arrayRef.start(0)
+                    arrayRef_pcnt=0
+                    done=False
+                    openIndex=0
+                    closeIndex=0
+                    while not done:
+                        if compKernelB[arrayRef_it]=='[':
+                            if arrayRef_pcnt==0:
+                                #tempCode[arrayRef_it]='('
+                                openIndex=arrayRef_it
+                                #compKernelB=compKernelB[:arrayRef_it]+'('+compKernelB[arrayRef_it+1:]
+                            arrayRef_pcnt+=1
+                        elif compKernelB[arrayRef_it]==']':
+                            arrayRef_pcnt-=1
+                            if arrayRef_pcnt==0:
+                                #tempCode[arrayRef_it]=')'
+                                closeIndex=arrayRef_it
+                                #compKernelB=compKernelB[:arrayRef_it]+')'+compKernelB[arrayRef_it+1:]
+                                done=True
+                        if done==True:
+                            while True:
+                                if compKernelB[arrayRef_it]=='=':
+                                    compKernelB=compKernelB[:arrayRef_it+1]+" compress_"+compVarObj.type+'('+compKernelB[arrayRef_it+1:]
+                                    compKernelB=compKernelB[:compKernelB.find(';',arrayRef_it)]+','+'__compress_constant_main_'+str(compVarObj.varName)+')'+compKernelB[compKernelB.find(';',arrayRef_it):]
+                                    break;
+                                elif compKernelB[arrayRef_it]==';':
+                                    compKernelB=compKernelB[:openIndex]+'('+compKernelB[openIndex+1:]
+                                    compKernelB=compKernelB[:closeIndex]+')'+compKernelB[closeIndex+1:]
+                                    break;
+                                arrayRef_it+=1
+                        arrayRef_it+=1
+                #proto="__constant__ float __compress_constant_"+var+"[10];\n"+proto
+        middleCode=code
+        code=simpleCodeInit
+        code+=middleCode
         code='\n'.join([smc_select_calls,smc_write_calls])+code
         code+=decl
         code+=kernelB
         code=code+'}\n'
+        compCode=''
+        if len(self.oacc_kernelsComp[kernelId])!=0:
+            compCode=compCodeInit
+            compCode+=middleCode
+            compCode='\n'.join([smc_select_calls,smc_write_calls])+compCode
+            compCode+=decl
+            compCode+=compKernelB
+            compCode=compCode+'}\n'
+            for compVarObj in self.oacc_kernelsComp[kernelId]:
+                compCode+='#undef '+str(compVarObj.varName) + '\n'
         for [fname, prototype, declbody] in self.active_calls_decl:
             code=re.sub('\\b'+fname+'[\\ \\t\\n\\r]*\(','__accelerator_'+fname+'(', code)
-        return [proto, code]
+        for [fname, prototype, declbody] in self.active_calls_decl:
+            compCode=re.sub('\\b'+fname+'[\\ \\t\\n\\r]*\(','__accelerator_'+fname+'_compression(', compCode)
+            m=re.search(fname+'_compression\s*\((.*?)\)',compCode,re.S)
+            if m:
+                argList = m.group(1).split(',')
+                for compVarObj in self.oacc_kernelsComp[kernelId]:
+                    for arg in argList:
+                        if arg.strip()==str(compVarObj.varName):
+                            argList.append('__compress_constant_'+str(compVarObj.varName))
+                compCode=compCode.replace(m.group(0),fname+'_compression('+','.join(argList)+')')
+        return [proto, code+compCode]
     def memAlloc_cuda(self, var, size):
         codeM='cudaMalloc((void**)&'+var+','+size+');\n'
         return codeM
@@ -1078,12 +1222,69 @@ class codegen(object):
             type_decls+=fwdcl+'\n'
         return type_decls
     def getFuncDecls_cuda(self):
-        code=''
+        compCode=''
+        simpleCode=''
         for [fname, prototype, declbody] in self.active_calls_decl:
-            code +='__device__ '+declbody+'\n'
+            compTempCode=''
+            simpleTempCode=''
+            tempDecl=declbody
+            m=re.search(fname+'\s*\((.*?)\)',tempDecl,re.S)
+            argList = m.group(1).split(',')
+            if fname in self.func_comp_vars:
+                for compArgTuple in self.func_comp_vars[fname]:
+                    for arg in argList:
+                        if compArgTuple[0] == arg.strip().replace('*',' ').split()[1]:
+                            argList.append(arg.replace(compArgTuple[0],'__compress_constant_'+compArgTuple[0]))
+                            compTempCode='#define '+compArgTuple[0]+'(index) decompress_'+arg.strip().replace('*',' ').split()[0]+'((void*)'+compArgTuple[0]+', index, __compress_constant_main_'+compArgTuple[0]+')\n'
+            tempDecl=tempDecl.replace(m.group(1),','.join(argList)) 
+            simpleTempCode +='__device__ '+declbody+'\n'
+            compTempCode +='__device__ '+tempDecl+'\n'
+            #simpleTempCode=re.sub('\\b'+fname+'[\\ \\t\\n\\r]*\(','__accelerator_'+fname+'(', simpleTempCode)
+            #compTempCode=re.sub('\\b'+fname+'[\\ \\t\\n\\r]*\(','__accelerator_'+fname+'_compression(', compTempCode)
+            if fname in self.func_comp_vars:
+                for compArgTuple in self.func_comp_vars[fname]:
+                    compTempCode+='#undef '+compArgTuple[0]+'\n'
+            for [funcName, prototype, declbody] in self.active_calls_decl:
+                if funcName != fname:
+                    m=re.search(funcName+'\s*\((.*?)\)',compTempCode,re.S)
+                    if m:
+                        argList = m.group(1).split(',')
+                        if fname in self.func_comp_vars:
+                            for compVarTuple in self.func_comp_vars[fname]:
+                                for arg in argList:
+                                    if arg.strip()==compVarTuple[0]:
+                                        dummy=1
+                                       # argList.append('__compress_constant_'+compVarTuple[0])
+                        compTempCode=compTempCode.replace(m.group(0),funcName+'('+','.join(argList)+')')
+            # Change compressed array accesses to macro [] => ()
+            if fname in self.func_comp_vars:
+                for compArgTuple in self.func_comp_vars[fname]:
+                    var=compArgTuple[0]
+                    for arrayRef in re.finditer('\\b'+var+'[\\ \\t\\n\\r]*\[',compTempCode):
+                        arrayRef_it=arrayRef.start(0)
+                        arrayRef_pcnt=0
+                        done=False
+                        while not done:
+                            if compTempCode[arrayRef_it]=='[':
+                                if arrayRef_pcnt==0:
+                                    #tempCode[arrayRef_it]='('
+                                    compTempCode=compTempCode[:arrayRef_it]+'('+compTempCode[arrayRef_it+1:]
+                                arrayRef_pcnt+=1
+                            elif compTempCode[arrayRef_it]==']':
+                                arrayRef_pcnt-=1
+                                if arrayRef_pcnt==0:
+                                    #tempCode[arrayRef_it]=')'
+                                    compTempCode=compTempCode[:arrayRef_it]+')'+compTempCode[arrayRef_it+1:]
+                                    done=True
+                            arrayRef_it+=1
+
+            compCode+=compTempCode
+            simpleCode+=simpleTempCode
         for [fname, prototype, declbody] in self.active_calls_decl:
-            code=re.sub('\\b'+fname+'[\\ \\t\\n\\r]*\(','__accelerator_'+fname+'(', code)
-        return code
+            simpleCode=re.sub('\\b'+fname+'[\\ \\t\\n\\r]*\(','__accelerator_'+fname+'(', simpleCode)
+        for [fname, prototype, declbody] in self.active_calls_decl:
+            compCode=re.sub('\\b'+fname+'[\\ \\t\\n\\r]*\(','__accelerator_'+fname+'_compression(', compCode)
+        return simpleCode+compCode
     def getFuncProto_cuda(self):
         code=''
         for [fname, prototype, declbody] in self.active_calls_decl:
@@ -1161,7 +1362,6 @@ class codegen(object):
         # construct smc calls
         smc_select_calls=''
         if len(smcinfo)>0:
-            if DEBUGSMC: print 'found smc clause'
             pfreelist=[]
             for [v, t, st, p, dw, up, div, a, dimlo, dimhi] in smcinfo:
                 fcall=self.prefix_kernel_smc_fetch+str(a)+'();'
@@ -1332,7 +1532,7 @@ class codegen(object):
             code+='//^D end global critical secion\n'
         code+='}\n'
         return code
-    def constructKernel_opencl(self, args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, template, smcinfo):
+    def constructKernel_opencl(self, args, decl, kernelB, kernelId, privinfo, reduinfo, ctasize, forDims, template, smcinfo, compInfo):
         code =template+' __kernel void '+self.prefix_kernel_gen+str(kernelId)
         suff_args=[]
         for idx in range(0,len(args)):
@@ -1400,7 +1600,7 @@ class codegen(object):
                 decl+='{\n'
                 decl+='int iterator_of_smc=0;\n'
                 decl+='for(iterator_of_smc=get_local_id(0); iterator_of_smc<('+length+'); iterator_of_smc+=get_local_size(0)){\n'
-                decl+='// '+self.prefix_kernel_smc_varpref+v+'[iterator_of_smc]=0;\n'
+                decl+=self.prefix_kernel_smc_varpref+v+'[iterator_of_smc]=0;\n'
                 decl+=self.prefix_kernel_smc_tagpref+v+'[iterator_of_smc]=0;\n'
                 decl+='}\nbarrier(CLK_LOCAL_MEM_FENCE);\n'
                 decl+='}\n'
@@ -1627,6 +1827,7 @@ class codegen(object):
             if root.tag == 'for':
                 self.code=self.code+str('\t'*depth)+'for('+str(root.attrib.get('initial'))+';'+str(root.attrib.get('boundary'))+';'+str(root.attrib.get('increment'))+')'
             elif (root.tag=='pragma' and root.attrib.get('directive')=='data'):
+#                print "data"
                 # parse data clauses and
                 [expressionIn, expressionAlloc, expressionOut, expressionAll] = self.oacc_clauseparser_data(str(root.attrib.get('clause')),str(self.oacc_copyId))
                 if DEBUGCP>0:
@@ -1685,7 +1886,7 @@ class codegen(object):
         old_stdout = sys.stdout
         f = open(filename,'w')
         sys.stdout = f
-        print self.code_include+self.code
+        print self.code_include+self.oacc_constCoefDefs+self.code
         f.close()
         sys.stdout = old_stdout
         if ENABLE_INDENT==True:
@@ -2059,6 +2260,9 @@ class codegen(object):
                 parentFunc=''
                 clause=''
                 dataid=''
+                compression=''
+                min=''
+                max=''
                 if DEBUGCP>1:
                     print 'Copy tuple > '+j
                 for (a, b, c, d, e) in regex.findall(j):
@@ -2082,6 +2286,12 @@ class codegen(object):
                         clause=d
                     elif a=='dataid':
                         dataid=d
+                    elif a=='compression':
+                        compression=d
+                    elif a=='max':
+                        max=d
+                    elif a=='min':
+                        min=d
                 # handle dynamic allocation here
                 if size.find('dynamic')!=-1:
                     if size.count('dynamic')!=len(dim) and not self.oacc_data_dynamicAllowed(clause):
@@ -2116,7 +2326,7 @@ class codegen(object):
                         codeM+=self.codegen_accDevicePtr(dname,size,varname,type,scalar_copy)
                         codeM+='if('+dname+'==NULL){\n'
                         codeM=codeM+'ipmacc_prompt((char*)"IPMACC: memory allocation '+varname+'\\n");\n'
-                        codeM+=self.codegen_memAlloc(dname,size,varname,type,scalar_copy, ispresent)
+                        codeM+=self.codegen_memAlloc(dname,size,varname,type,scalar_copy, ispresent,compression,min,max)
                         codeM+='}\n'
                         print 'unexpected reach! '
                         exit(-1)
@@ -2124,7 +2334,7 @@ class codegen(object):
                         # this line is removed
                         # codeM+='if(!'+dname+self.suffix_present+'){\n'
                         codeM=codeM+'ipmacc_prompt((char*)"IPMACC: memory allocation '+varname+'\\n");\n'
-                        codeM+=self.codegen_memAlloc(dname,size,varname,type,scalar_copy, ispresent)
+                        codeM+=self.codegen_memAlloc(dname,size,varname,type,scalar_copy, ispresent,compression,min,max)
                         # this line too codeM+='}\n'
                     self.varmapper_allocated.append((parentFunc,dname,dataid))
                 # generate memory copy code
@@ -2132,9 +2342,15 @@ class codegen(object):
                     codeCin+='ipmacc_prompt((char*)"IPMACC: memory copyin '+varname+'\\n");\n'
                     #codeC+=self.codegen_memCpy(dname, ('&' if scalar_copy else '')+varname, size, 'in')
                     codeCin+=self.codegen_accCopyin(('&' if scalar_copy else '')+varname, dname, size, type, '', scalar_copy )
+                if clause=='ccopyin' or clause=='compression_copyin' or clause=='ccopy' or clause=='compression_copy':
+                    codeCin+='ipmacc_prompt((char*)"IPMACC: compression and memory copyin '+varname+'\\n");\n'
+                    codeCin+=self.codegen_accCompCopyin(('&' if scalar_copy else '')+varname, dname, size, type, '', scalar_copy,parentFunc,min,max)
                 if clause=='pcopyin' or clause=='pcopy' or clause=='present_or_copyin' or clause=='present_or_copy':
                     codeCin+='ipmacc_prompt((char*)"IPMACC: memory copyin '+varname+'\\n");\n'
                     codeCin+=self.codegen_accCopyin(('&' if scalar_copy else '')+varname, dname, size, type, 'p', scalar_copy)
+                if clause=='pccopyin' or clause=='pccopy' or clause=='present_or_compression_copyin' or clause=='present_or_compression_copy':
+                    codeCin+='ipmacc_prompt((char*)"IPMACC: compression and memory copyin '+varname+'\\n");\n'
+                    codeCin+=self.codegen_accCompCopyin(('&' if scalar_copy else '')+varname, dname, size, type, 'p', scalar_copy,parentFunc,min,max)
                 #if clause=='present_or_create':
                 #    codeCin+='ipmacc_prompt("IPMACC: memory create or getting device pointer for '+varname+'\\n");\n'
                 #    codeCin+=self.codegen_memAlloc(('&' if scalar_copy else '')+varname, dname, size, type)
@@ -2146,6 +2362,11 @@ class codegen(object):
                     #codeC+=self.codegen_memCpy(('&' if scalar_copy else '')+varname, dname, size, 'out')
                     #codeM+=self.codegen_memAlloc(dname,size,varname,type,scalar_copy, ispresent)
                     codeCout+=self.codegen_accPCopyout(('&' if scalar_copy else '')+varname, dname, size, type, scalar_copy)
+                if clause=='ccopy' or clause=='compression_copy' or clause=='pccopy' or clause=='present_or_copression_copy':
+                    codeCout+='ipmacc_prompt((char*)"IPMACC: memory copyout and decompression '+varname+'\\n");\n'
+                    #codeC+=self.codegen_memCpy(('&' if scalar_copy else '')+varname, dname, size, 'out')
+                    #codeM+=self.codegen_memAlloc(dname,size,varname,type,scalar_copy, ispresent)
+                    codeCout+=self.codegen_accPCompCopyout(('&' if scalar_copy else '')+varname, dname, size, type, scalar_copy,parentFunc)
             #self.code_include=self.code_include+vardeclare
             self.code=self.code.replace(self.prefix_dataalloc+str(i)+'();',vardeclare+codeM)
             self.code=self.code.replace(self.prefix_datacpin+str(i)+'();',codeCin)
@@ -2172,6 +2393,7 @@ class codegen(object):
                 reduc=''
                 griddimen=''
                 dataid=str(i)
+                compression=''
 #                regex = re.compile(r'([a-zA-Z0-9_]*)([=])(\")([a-zA-Z0-9_:\(\)\*\ ]*)(\")')
                 for (a, b, c, d, e) in regex.findall(j):
                     if a=='varname':
@@ -2192,6 +2414,8 @@ class codegen(object):
                         parentFunc=d
                     elif a=='operat':
                         reduc=d
+                    elif a=='compression':
+                        compression=d
                 if varname=='':
                     # invalid tuple, ignore
                     continue
@@ -2704,8 +2928,7 @@ class codegen(object):
                     except:
                         print 'Error: Could not determine the type of variable declared for smc: '+variable
                         exit(-1)
-                    endList.append([variable, type, smctype, pivot, dwrange, uprange, diverge, corr, dimlow, dimhigh])
-                    #endList.append([variable, type, smctype, pivot, dwrange, uprange, diverge, kid, dimlow, dimhigh])
+                    endList.append([variable, type, smctype, pivot, dwrange, uprange, diverge, kid, dimlow, dimhigh])
             corr+=1
         return endList
 
@@ -3108,13 +3331,29 @@ class codegen(object):
 
     def var_kernel_genPlainCode(self, id, root, nesting):
         code=''
+        vars=[]
         try:
             if root.tag=='pragma':
                 if root.attrib.get('directive')=='kernels':
+                    compVarList=[]
+                    for [i0, i3] in clauseDecomposer_break(root.attrib.get('clause')):
+                        if str(i0).strip()=='compression':
+                            for j in str(i3).replace(' ','').strip().split(','):
+                                var=str(j).split('[')[0]
+                                compVarList.append(compVar(var))
+                    self.oacc_kernelsComp.append(compVarList)
+                    #retrieve compression clause and `define a(index) decompress() 
+                    for [i0, i3] in clauseDecomposer_break(root.attrib.get('clause')):
+                        if str(i0).strip()=='compression':
+                            for j in str(i3).replace(' ','').strip().split(','):
+                                var=str(j).split('[')[0]
+                                vars.append(str(var))
                     code=code+'{\n'
+                    #tempCode=''
                     for ch in root:
-                        code=code+self.var_kernel_genPlainCode(id, ch, nesting)
+                        code+=self.var_kernel_genPlainCode(id, ch, nesting)
                     code=code+'}\n'
+                    
                 elif root.attrib.get('directive')=='loop':
                     [indep, priv, reduc, gang, vector, smc]=self.oacc_clauseparser_loop_isindependent(root.attrib.get('clause'))
                     for ch in root:
@@ -3201,6 +3440,31 @@ class codegen(object):
     def debug_dump_smcInfo(self, smcList):
         for [variable, type, smctype, pivot, dwrange, uprange, diverge, kid, dimlo, dimhi] in smcList:
             print 'SMC info: variable: '+variable+' type: '+type+' smctype: '+smctype+' pivot: '+pivot+' dwrange: '+dwrange+' uprange: '+uprange+' divergent: '+diverge+' assignee: '+str(kid)+' dimlow: '+dimlo+' dimhigh: '+dimhi
+    
+    def recursive_compVar_tracer(self,fname,compArgsInd):
+        for i in range(0,len(self.active_calls_decl)):
+            if self.active_calls_decl[i][0]==fname:
+                curFuncInd=i
+                m=re.search(fname+'\s*\((.*?)\)',self.active_calls_decl[i][2],re.S)
+                #print m.group(1)
+                argList = m.group(1).split(',')
+                for argIndex in compArgsInd:
+                    self.func_comp_vars[fname].append([argList[argIndex[0]].replace('*',' ').strip().split()[-1],argIndex[1]])
+                break
+        for fCall in self.active_calls_decl:
+            if self.active_calls_decl[curFuncInd][2].find(fCall[0])!=-1 and self.active_calls_decl[curFuncInd][0]!=fCall[0]:
+                funcCompArgList=[]
+                m=re.search(fCall[0]+'\s*\((.*?)\)',self.active_calls_decl[curFuncInd][2],re.S)#assume there's no parentheses in function arguments
+                argList = m.group(1).split(',')
+                for compVar in self.func_comp_vars[fname]:
+                    for arg in argList:
+                       # print arg.strip()
+                        if compVar[0] == arg.strip():
+                            funcCompArgList.append([argList.index(arg),compVar[1]])
+#                            argList.append("__conpress_constant_"+compVar[0])
+#                self.active_calls_decl[curFuncInd][2]=self.active_calls_decl[curFuncInd][2].replace(m.group(0),fCall[0]+'_compression('+','.join(argList)+')')
+                self.recursive_compVar_tracer(fCall[0],funcCompArgList)
+                
     def generate_code(self):
         Argus=[]
         KBody=[]
@@ -3209,6 +3473,7 @@ class codegen(object):
         Privs=[]
         Redus=[]
         Smcis=[]
+        CompList=[]
         for i in range(0,len(self.oacc_kernels)):
             if DEBUGLD:
                 print 'finding the kernel dimension (`for` size)...'
@@ -3240,6 +3505,8 @@ class codegen(object):
             Privs.append(privInfo)
             Redus.append(reduInfo)
             Smcis.append(smcInfo)
+            compInfo=self.oacc_kernelsComp[i]
+            CompList.append(compInfo)
         
         self.var_copy_assignExpDetail(FDims, (self.blockDim_cuda if self.target_platform=='CUDA' else self.blockDim_opencl))
         self.var_copy_genCode()
@@ -3260,23 +3527,78 @@ class codegen(object):
             privInfo=    Privs[i]
             reduInfo=    Redus[i]
             smcInfo=     Smcis[i]
+            compInfo= CompList[i]
             if DEBUGPRIVRED:
                 self.debug_dump_privredInfo('private',privInfo)
                 self.debug_dump_privredInfo('reduction',reduInfo)
             # loop continue
-            [kernelPrototype, kernelDecl]=self.codegen_constructKernel(args, declaration, kernelBody, i, privInfo, reduInfo, (self.blockDim_cuda if self.target_platform=='CUDA' else self.blockDim_opencl), forDims, smcInfo)
+            [kernelPrototype, kernelDecl]=self.codegen_constructKernel(args, declaration, kernelBody, i, privInfo, reduInfo, (self.blockDim_cuda if self.target_platform=='CUDA' else self.blockDim_opencl), forDims, smcInfo, compInfo)
+            
             self.codegen_appendKernelToCode(kernelPrototype, kernelDecl, i, forDims, args, smcInfo)
+            for fCall in self.active_calls_decl:
+                if kernelDecl.find(fCall[0])!=-1:
+                    funcCompArgList=[]
+                    m=re.search(fCall[0]+'\((.*?)\)',kernelDecl,re.S)
+                    argList = m.group(1).split(',')
+                    for compVarObj in self.oacc_kernelsComp[i]:
+                        #print compVar 
+                        #print fCall[0]
+                        for arg in argList:
+                            #print arg.strip()
+                            if compVarObj.varName == arg.strip():
+                                funcCompArgList.append([argList.index(arg),compVarObj.varName])
+                        #print funcCompArgList  
+#                    kernelDecl=kernelDecl.replace(m.group(0),'__accelerator_'+fCall[0]+'('+','.join(argList)+')')
+                    self.recursive_compVar_tracer(fCall[0],funcCompArgList)
+
+
 
         if self.target_platform=='OPENCL':
             for k in range(0,len(self.code_kernels)):
                 self.code=self.code.replace(self.prefix_kernel+str(k)+'();',self.code_kernels[k])
         if self.target_platform=='CUDA':
+            if len(self.oacc_kernelsComp)>0:
+                #print self.oacc_kernelsComp
+                self.code+="__device__ __inline unsigned short compress_float(float fNum, float* coef){\n\
+                 float temp;\n\
+                 temp = fNum*coef[2]+1.5;\n\
+                 return (unsigned short)(((*((unsigned int*)&temp))>>7)&0x0000FFFF);\n}\n"
+                self.code+="__device__ __inline unsigned short compress_double(double dNum, double* coef){\n\
+                 double temp;\n\
+                 temp = dNum*coef[2]+1.5;\n\
+                 return (unsigned int)(((*((unsigned long long*)&temp))>>20)&0x00000000FFFFFFFF);\n}\n"
+                self.code+="__device__ __inline float decompress_float(void *ptr,int index,float* coef){\n\
+                 unsigned int temp;\n\
+                 temp=((unsigned short*)ptr)[index];\n\
+                 temp=temp<<7;\n\
+                 return ((*((float*)&(temp=temp | 0x3F800000))*coef[0]+coef[1]));\n}\n"
+                self.code+="__device__ __inline double decompress_double_CR4(void *ptr,int index,double* coef){\n\
+                 unsigned long long temp;\n\
+                 temp=((unsigned short*)ptr)[index];\n\
+                 temp=temp<<(20+16);\n\
+                 return (*((double*)&(temp=temp | 0x3FF0000000080000))*coef[0]+coef[1]);\n}\n"
+                self.code+="__device__ __inline double decompress_double(void *ptr,int index,double* coef){\n\
+                 unsigned long long temp;\n\
+                 temp=((unsigned int*)ptr)[index];\n\
+                 temp=temp<<20;\n\
+                 return (*((double*)&(temp=temp | 0x3FF0000000080000))*coef[0]+coef[1]);\n}\n"
             # we can make OpenCL to follow this, however, separating them is easier to debug final code
             #self.code =self.codegen_getFuncProto()  +self.cuda_kernelproto+self.code
             #self.code =self.codegen_getTypeFwrDecl()+self.code
             self.code+=self.codegen_getFuncDecls()  +self.cuda_kerneldecl
-            self.codegen_renameStadardTypes()
+            #self.codegen_renameStadardTypes()
+            #ebad flag
+            #print 'copysVarNams:\n----------------\n'+str(self.oacc_copysVarNams)
+        #print 'copysParent:\n----------------\n'+str(self.oacc_copysParent)
+        #for i in self.oacc_copys:
+        #    print 'copys:\n'+str([0]) + i[1]
 
+
+
+
+
+    
+        
 # check for codegen options
 parser = OptionParser()
 parser.add_option("-f", "--file", dest="filename",
@@ -3297,7 +3619,6 @@ if options.filename=="":
 else:
     print '\twarning: Storing the translated code in <'+options.filename+'> (target: <'+options.target_platform+'>)'
 
-
 # read the input XML which is validated by parser
 tree = ET.parse('__inter.xml')
 root = tree.getroot()
@@ -3309,7 +3630,6 @@ k = codegen(options.target_platform, options.filename, options.nvcc_args)
 
 # prepare the destination code by parsing the XML tree
 k.code_descendentRetrieve(root,0,[])
-
 if True or k.acc_detected():
     if not CLEARXML:
         k.code_kernelDump(0);
@@ -3330,6 +3650,7 @@ if True or k.acc_detected():
     k.var_copy_parentsFind()
     # find the implicit copies
     #k.var_copy_varSizeFind()
+
     if DEBUGSTMBRK:
         print k.code
         for [typ,stm] in k.code_getAssignments(k.code,['def','inc','typ','str']):
@@ -3338,9 +3659,7 @@ if True or k.acc_detected():
 else:
     print 'warning: no OpenACC kernel region is detected.'
 
-
 # prepare to write the code to output
 k.code_descendentDump(options.filename)
-
 if VERBOSE:
     print "code geneneration completed!"
