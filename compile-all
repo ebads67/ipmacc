@@ -32,13 +32,13 @@ echo -en '.'
 ln -s $ROOTDIR/src/utils_clause.py $ROOTDIR/parser/
 echo '. done'
 # srcML
-echo -en '~ compiling srcML parser .'
-cd $ROOTDIR/srcML/
-tar xvzf srcml.tar.gz > /dev/null
-cd src/
-make > /dev/null
-#ln -s $ROOTDIR/srcML/wrapper/wrapper.py $ROOTDIR/wrapper.py
-echo '. done'
+#echo -en '~ compiling srcML parser .'
+#cd $ROOTDIR/srcML/
+#tar xvzf srcml.tar.gz > /dev/null
+#cd src/
+#make > /dev/null
+##ln -s $ROOTDIR/srcML/wrapper/wrapper.py $ROOTDIR/wrapper.py
+#echo '. done'
 
 # Scanner and CUDA code generator
 cd $ROOTDIR
@@ -54,7 +54,6 @@ echo -en '~ compiling OpenACC API .'
 cd $ROOTDIR/src/
 make > /dev/null
 echo '. done'
-
 
 # set environment
 #export LD_LIBRARY_PATH=$ROOTDIR/lib:$LD_LIBRARY_PATH

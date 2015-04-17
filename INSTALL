@@ -34,69 +34,18 @@ Optional:
 ====================
 Installation:
 Step 1:
-    Modify the 'setup_environment' file in the ipmacc root directory and set variables properly according to the information given there. Then, source this file to have proper environment in the current bash:
-    $ source ./setup_environment
-    
-    Notice that these variables are needed everytime you use IPMACC to compile applications or run the generated binaries. You may prefer to put the above command in the home bash file (e.g. ~/.bashrc).
-    
-    If the environment is setup properly, ipmacc should be available on the PATH: 
-    $ which ipmacc
+Modify the 'setup_environment' file in the ipmacc root directory and set variables properly according to the information given there. Then, source this file to have proper environment in the current bash:
+$ source ./setup_environment
+
+Notice that these variables are needed everytime you use IPMACC to compile applications or run the generated binaries. You may prefer to put the above command in the home bash file (e.g. ~/.bashrc).
+
+If the environment is setup properly, ipmacc should be available on the PATH: 
+$ which ipmacc
 
 Step 2:
-    Start compilation by:
-    $ chmod +x ./compile-all
-    $ ./compile-all
-    
-    In this step, you me see several warnings but there shouldn't be any error! Compilation successfully terminates with the following prompt:
-    ~ compiling OpenACC API .. done
-
-Step 3:
-    At this step, you should be able to see ipmacc on the command-line:
-    $ ipmacc --version
-    IPMACC 0.7.5b
-    Also get available accelerators using:
-    $ ipmacc --list-devices CUDA
-    or
-    $ ipmacc --list-devices OCL 
-    There shouldn't be any error up to this point.
-
-Step 4:
-    Compile and run samples in test-case/ directory:
-    [lashgar@sysadm2 test-case]$ ipmacc vectorAdd.c -o vectorAdd
-            warning: Storing the translated code in <vectorAdd_ipmacc.cu> (target: <nvcuda>)
-    nvcc warning : The 'compute_10' and 'sm_10' architectures are deprecated, and may be removed in a future release.
-    [lashgar@sysadm2 test-case]$ ./vectorAdd
-    Calculation on GPU ...  150.0000 ms
-    Calculation on GPU ...  10.0000 ms
-    Calculation on GPU ...  0.0000 ms
-    Calculation on CPU ...  0.0000 ms
-    OpenACC vectoradd test was successful!
-    [lashgar@sysadm2 test-case]$ ipmacc vectorAdd.c -o vectorAdd -arch=sm_35
-            warning: Storing the translated code in <vectorAdd_ipmacc.cu> (target: <nvcuda>)
-    [lashgar@sysadm2 test-case]$ ./vectorAdd
-    Calculation on GPU ...  140.0000 ms
-    Calculation on GPU ...  0.0000 ms
-    Calculation on GPU ...  0.0000 ms
-    Calculation on CPU ...  0.0000 ms
-    OpenACC vectoradd test was successful!
-    [lashgar@sysadm2 test-case]$ 
-
-Step 5:
-    Verify correctness of ipmacc under latest features (software-managed cache and two-dimensional grid/thread block) by:
-    [lashgar@sysadm2 ipmacc]$ cd test-case/rodinia/smc/hotspot/
-    [lashgar@sysadm2 ipmacc]$ cat README
-    [lashgar@sysadm2 hotspot]$ bash testbench
-
-Step 6:
-    Verify correctness of all available benchmarks by running compare_cuda.sh and compare_opencl.sh in test-case/rodinia/:
-    $ cd test-case/rodinia/
-    $ bash ./compare_cuda.sh
-    Executing above instructions compares the memory and kernel time of OpenACC-over-CUDA and CUDA versions.
-    Similarily, compare OpenACC-over-OpenCL and OpenCL versions.
-    $ bash ./compare_opencl.sh  
-    
-    Notice: these files rely on NVIDIA CUDA and NVIDIA OpenCL runtime.
-    Notice: there are many configurable parameters in these scripts. Just look them up!
+Start compilation by:
+$ chmod +x ./compile-all
+$ ./compile-all
 
 ====================
 Usage:
@@ -111,11 +60,4 @@ $ <ipmacc-flags> ipmacc <c-file> <compile-flags>
 IPMACC translates OpenACC API (function calls or directives) in the input C-file to OpenCL/CUDA source. In case no compilation flag is passed, and if the compilation succeeds, two files will be generated:
     1) the translation destination OpenCL/CUDA source file is created in the same path as the C-file, with the `_ipmacc.[cu/c/cpp]` suffix.
     2) a.out is generated in current directory
-
-
-====================
-Known issues:
--srcML, the parser which is used in IPMACC, has a compatibility issue with latest version of libxml2. In future release of IPMACC, we plan to include the compatible version of libxml2 in the package. To resolve this issue, use libxml2-2.7.6 which can be downloaded from here:
-ftp://gd.tuwien.ac.at/pub/libxml/
-
 

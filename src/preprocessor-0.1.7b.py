@@ -102,7 +102,7 @@ class preprocr(object):
             tagtoprint="#pragma acc "
             tagtoprint=tagtoprint+directive+" "
             tagtoprint=tagtoprint+clause+"\n{\n"
-            if (directive=="kernels" or directive=="data" or directive=="loop" or directive=="cache"):
+            if (directive=="kernels" or directive=="data" or directive=="loop"):
                 # find the region
                 self.pendingpragma = self.pendingpragma + 1
             else:

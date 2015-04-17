@@ -595,7 +595,7 @@ class codegen(object):
         code=''
         if self.target_platform=='CUDA':
             # TODO code+=dev+'=('+type+ast+')acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
-            code+='acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
+            code+='acc_'+present+'copyin((void*)'+host+','+bytes+', "'+type.replace('*','').strip()+'"); // '+type+'\n'
         elif self.target_platform=='OPENCL':
             # code+=dev+'=(cl_mem)acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
             code+='acc_'+present+'copyin((void*)'+host+','+bytes+');\n'
@@ -3298,7 +3298,7 @@ if True or k.acc_detected():
     if not CLEARXML:
         k.code_kernelDump(0);
     k.codegen_includeHeaders()
-
+    print k.code
     # proper dumps
     #k.code_descendentDump(sys.stdout)
     #k.code_kernelPrint(0)
